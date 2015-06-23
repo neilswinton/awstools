@@ -55,7 +55,7 @@ def main():
     else:
         persist = args.persist
 
-    tags = dict(persist=str(persist))
+    tags = dict(Persist=str(persist))
     if args.owner:
         tags["Owner"] = args.owner
 
