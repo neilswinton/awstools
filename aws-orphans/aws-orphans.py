@@ -39,37 +39,145 @@ class CustomerContainer:
     def keys(self):
         return self.customer_to_resource.keys()
 
+    def print_customer_resources(self, customer, message):
+        for resource in self[customer]:
+            print message % customer
 
-class Policies(CustomerContainer):
-    def __init__(self):
-        CustomerContainer.__init__(self, False)
+
+class NamedListBase(CustomerContainer):
+    def __init__(self, lister, item_name_to_customer_name):
+        CustomerContainer.__init__(self, case_sensitive=False)
+        self.lister = lister
+        self.item_name_to_customer_name = item_name_to_customer_name
 
     def load(self):
+        for item in self.lister():
+            name = self.item_name_to_customer_name(item)
+            item_list = self.customer_find_or_create(name)
+            item_list.append(item)
+
+class Policies(NamedListBase):
+    customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
+
+    def __init__(self):
+        NamedListBase.__init__(self, Policies.get_policy_list, Policies.policy_name_to_customer_name)
+
+    @staticmethod
+    def get_policy_list():
         iam = boto3.client("iam")
         policies = iam.list_policies()
         for policy in policies["Policies"]:
-            policy_list = self.customer_find_or_create(policy["PolicyName"])
-            policy_list.append(policy)
+            policy_name = policy["PolicyName"]
+            if policy_name.endswith("-s3") or policy_name.endswith("-provisioner"):
+                yield policy
+
+    @staticmethod
+    def policy_name_to_customer_name(item):
+        match = Policies.customer_name_re.match(item["PolicyName"])
+        return match.group("customer")
 
     def print_orphans(self, customer):
         for policy in self[customer]:
-            print "Orphan IAM Policy: %s" % customer
+            print "\tOrphan IAM Policy: %s" % customer
 
+class Roles(NamedListBase):
+    customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
 
-class Roles(CustomerContainer):
     def __init__(self):
-        CustomerContainer.__init__(self, False)
+        NamedListBase.__init__(self, Roles.get_role_list, Roles.role_name_to_customer_name)
 
-    def load(self):
+    @staticmethod
+    def get_role_list():
         iam = boto3.client("iam")
         roles = iam.list_roles()
         for role in roles["Roles"]:
-            role_list = self.customer_find_or_create(role["RoleName"])
-            role_list.append(role)
+            role_name = role["RoleName"]
+            if role_name.endswith("-s3") or role_name.endswith("-provisioner"):
+                yield role
+
+    @staticmethod
+    def role_name_to_customer_name(item):
+        match = Roles.customer_name_re.match(item["RoleName"])
+        return match.group("customer")
 
     def print_orphans(self, customer):
-        for role in self[customer]:
-            print "Orphan IAM Role: %s" % customer
+        for policy in self[customer]:
+            print "\tOrphan IAM Role: %s" % customer
+
+class CryptoKeys(CustomerContainer):
+    def __init__(self, region):
+        CustomerContainer.__init__(self, case_sensitive=False)
+        self.region = region
+
+    def load(self):
+        kms = boto3.client('kms')
+        keys = kms.list_keys()
+
+        for key in keys["Keys"]:
+            arn = key['KeyArn']
+            arnparts = arn.split(":")
+            if arnparts[3].startswith(self.region):
+                info = kms.describe_key(KeyId=arn)
+                key_metadata = info['KeyMetadata']
+                description = None
+
+                try:
+                    description = json.loads(key_metadata['Description'])
+                except ValueError:
+                    pass
+
+                if description:
+                    # value = ":".join([x for x in description.values() if type(x) in [str, unicode]])
+                    customer = unicode(description['c'])
+                    if customer and description['s'] == 'used':
+                        key_list = self.customer_find_or_create(customer)
+                        key_list.append(key)
+
+    def print_orphans(self, customer):
+        self.print_customer_resources(customer, "Orphan crypto key: %s")
+
+class S3Buckets(NamedListBase):
+
+    customer_bucket_re = re.compile(
+        '^customer-(?P<customer>\w+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
+    def __init__(self):
+       NamedListBase.__init__(self, S3Buckets.get_bucket_list, S3Buckets.bucket_name_to_customer_name)
+
+    @staticmethod
+    def get_role_list():
+        s3 = boto3.client("s3")
+        bucketlisting = s3.list_buckets()
+        buckets = bucketlisting["Buckets"]
+        for bucket in buckets:
+            bucketname = bucket["Name"]
+            match = customer_bucket_re.match(bucketname)
+            if match and match.group("customer"):
+                yield
+
+    @staticmethod
+    def role_name_to_customer_name(item):
+        match = Roles.customer_name_re.match(item["RoleName"])
+        return match.group("customer")
+
+    def print_orphans(self, customer):
+        for policy in self[customer]:
+            print "\tOrphan IAM Role: %s" % customer
+       def load_s3_buckets(self):
+        # customer-<customername>-f4eb065-9bf0-4ef3-a9bf-33e0c7d8da56
+        customer_bucket_re = re.compile(
+            '^customer-(?P<customer>\w+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+        s3 = boto3.client("s3")
+        bucketlisting = s3.list_buckets()
+        buckets = bucketlisting["Buckets"]
+        for bucket in buckets:
+            bucketname = bucket["Name"]
+            match = customer_bucket_re.match(bucketname)
+            if match and match.group("customer"):
+                customer = unicode(match.group('customer'))
+                if not customer in self.customer_to_buckets:
+                    self.customer_to_buckets[customer] = []
+                self.customer_to_buckets[customer].append(bucketname)
 
 
 class Resources:
@@ -78,26 +186,30 @@ class Resources:
         self.customer_to_vpc = dict()
         self.unowned_vpcs = []
         self.vpc_instance_count = dict()
-        self.customer_keys = dict()
         self.customer_to_buckets = dict()
         self.active_customers = set()
         self.customer_names = []
         self.policies = Policies()
         self.roles = Roles()
+        self.crypto_keys = CryptoKeys(region)
+
 
     def load(self):
+        self.policies.load()
+        self.crypto_keys.load()
         self.roles.load()
         self.policies.load()
         self.load_s3_buckets()
-        self.load_customer_keys()
         self.load_vpcs()
 
         customer_found = set()
         collections = [
             (self.customer_to_vpc, True),
-            (self.customer_keys, False),
             (self.customer_to_buckets, False),
-            (self.policies, self.policies.case_sensitive)]
+            (self.policies, self.roles.case_sensitive),
+            (self.roles, self.policies.case_sensitive),
+
+            (self.crypto_keys, self.crypto_keys.case_sensitive)]
 
         for (collection, case_sensitive) in collections:
             for customer in collection.keys():
@@ -138,33 +250,10 @@ class Resources:
                 if active and customer not in self.active_customers:
                     self.active_customers.add(customer)
 
-    def load_customer_keys(self):
-        kms = boto3.client('kms')
-        keys = kms.list_keys()
-
-        for key in keys["Keys"]:
-            arn = key['KeyArn']
-            arnparts = arn.split(":")
-            if arnparts[3].startswith(self.region):
-                info = kms.describe_key(KeyId=arn)
-                key_metadata = info['KeyMetadata']
-                description = None
-
-                try:
-                    description = json.loads(key_metadata['Description'])
-                except ValueError:
-                    pass
-
-                if description:
-                    # value = ":".join([x for x in description.values() if type(x) in [str, unicode]])
-                    customer = unicode(description['c'])
-                    if customer and description['s'] == 'used':
-                        if not customer in self.customer_keys:
-                            self.customer_keys[customer] = []
-                        self.customer_keys[customer].append(key)
-
     def load_s3_buckets(self):
-        customer_bucket_re = re.compile('^customer-(?P<customer>\w+)-[0-9a-f\-]+')
+        # customer-<customername>-f4eb065-9bf0-4ef3-a9bf-33e0c7d8da56
+        customer_bucket_re = re.compile(
+            '^customer-(?P<customer>\w+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
         s3 = boto3.client("s3")
         bucketlisting = s3.list_buckets()
         buckets = bucketlisting["Buckets"]
@@ -190,19 +279,11 @@ class Resources:
                 for (key, value) in tags.iteritems():
                     print "\t\t%s: %s" % (key, value)
 
-    def print_orphan_key(self, customer):
-        customer = customer.lower()
-        if customer in self.customer_keys:
-            print "\tOrphan Crypto Key: %s" % customer
-            for key in self.customer_keys[customer]:
-                for (name, value) in key.iteritems():
-                    print "\t\t%s: %s" % (name, value)
-
     def print_orphans(self):
         for customer in self.customer_names:
             if not customer in self.active_customers:
                 print customer
-                self.print_orphan_key(customer)
+                self.crypto_keys.print_orphans(customer)
                 self.print_orphan_bucket(customer)
                 self.print_orphan_vpcs(customer)
                 self.policies.print_orphans(customer)
