@@ -36,6 +36,9 @@ class CustomerContainer:
             self.customer_to_resource[customer] = []
         return self.customer_to_resource[customer]
 
+    def is_case_sensitive(self):
+        return self.case_sensitive
+
     def keys(self):
         return self.customer_to_resource.keys()
 
@@ -45,22 +48,21 @@ class CustomerContainer:
 
 
 class NamedListBase(CustomerContainer):
-    def __init__(self, lister, item_name_to_customer_name):
+    def __init__(self, lister):
         CustomerContainer.__init__(self, case_sensitive=False)
         self.lister = lister
-        self.item_name_to_customer_name = item_name_to_customer_name
 
     def load(self):
-        for item in self.lister():
-            name = self.item_name_to_customer_name(item)
-            item_list = self.customer_find_or_create(name)
+        for (customer, item) in self.lister():
+            item_list = self.customer_find_or_create(customer)
             item_list.append(item)
+
 
 class Policies(NamedListBase):
     customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
 
     def __init__(self):
-        NamedListBase.__init__(self, Policies.get_policy_list, Policies.policy_name_to_customer_name)
+        NamedListBase.__init__(self, Policies.get_policy_list)
 
     @staticmethod
     def get_policy_list():
@@ -68,23 +70,24 @@ class Policies(NamedListBase):
         policies = iam.list_policies()
         for policy in policies["Policies"]:
             policy_name = policy["PolicyName"]
-            if policy_name.endswith("-s3") or policy_name.endswith("-provisioner"):
-                yield policy
+            if policy_name.endswith("-s3accessor") or policy_name.endswith("-provisioner"):
+                yield (Policies.policy_name_to_customer_name(policy_name), policy)
 
     @staticmethod
-    def policy_name_to_customer_name(item):
-        match = Policies.customer_name_re.match(item["PolicyName"])
+    def policy_name_to_customer_name(policy_name):
+        match = Policies.customer_name_re.match(policy_name)
         return match.group("customer")
 
     def print_orphans(self, customer):
         for policy in self[customer]:
-            print "\tOrphan IAM Policy: %s" % customer
+            print "\tOrphan IAM Policy: %s" % policy["PolicyName"]
+
 
 class Roles(NamedListBase):
     customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
 
     def __init__(self):
-        NamedListBase.__init__(self, Roles.get_role_list, Roles.role_name_to_customer_name)
+        NamedListBase.__init__(self, Roles.get_role_list)
 
     @staticmethod
     def get_role_list():
@@ -92,17 +95,18 @@ class Roles(NamedListBase):
         roles = iam.list_roles()
         for role in roles["Roles"]:
             role_name = role["RoleName"]
-            if role_name.endswith("-s3") or role_name.endswith("-provisioner"):
-                yield role
+            if role_name.endswith("-s3accessor") or role_name.endswith("-provisioner"):
+                yield (Roles.role_name_to_customer_name(role_name), role)
 
     @staticmethod
-    def role_name_to_customer_name(item):
-        match = Roles.customer_name_re.match(item["RoleName"])
+    def role_name_to_customer_name(role_name):
+        match = Roles.customer_name_re.match(role_name)
         return match.group("customer")
 
     def print_orphans(self, customer):
         for policy in self[customer]:
-            print "\tOrphan IAM Role: %s" % customer
+            print "\tOrphan IAM Role: %s" % policy["RoleName"]
+
 
 class CryptoKeys(CustomerContainer):
     def __init__(self, region):
@@ -134,100 +138,50 @@ class CryptoKeys(CustomerContainer):
                         key_list.append(key)
 
     def print_orphans(self, customer):
-        self.print_customer_resources(customer, "Orphan crypto key: %s")
+        self.print_customer_resources(customer, "\tOrphan crypto key: %s")
+
 
 class S3Buckets(NamedListBase):
-
     customer_bucket_re = re.compile(
-        '^customer-(?P<customer>\w+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+        '^customer-(?P<customer>\S+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 
     def __init__(self):
-       NamedListBase.__init__(self, S3Buckets.get_bucket_list, S3Buckets.bucket_name_to_customer_name)
+        NamedListBase.__init__(self, S3Buckets.get_bucket_list)
 
     @staticmethod
-    def get_role_list():
+    def get_bucket_list():
         s3 = boto3.client("s3")
         bucketlisting = s3.list_buckets()
         buckets = bucketlisting["Buckets"]
         for bucket in buckets:
             bucketname = bucket["Name"]
-            match = customer_bucket_re.match(bucketname)
+            match = S3Buckets.customer_bucket_re.match(bucketname)
             if match and match.group("customer"):
-                yield
-
-    @staticmethod
-    def role_name_to_customer_name(item):
-        match = Roles.customer_name_re.match(item["RoleName"])
-        return match.group("customer")
+                yield (match.group("customer"), bucketname)
 
     def print_orphans(self, customer):
-        for policy in self[customer]:
-            print "\tOrphan IAM Role: %s" % customer
-       def load_s3_buckets(self):
-        # customer-<customername>-f4eb065-9bf0-4ef3-a9bf-33e0c7d8da56
-        customer_bucket_re = re.compile(
-            '^customer-(?P<customer>\w+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-        s3 = boto3.client("s3")
-        bucketlisting = s3.list_buckets()
-        buckets = bucketlisting["Buckets"]
-        for bucket in buckets:
-            bucketname = bucket["Name"]
-            match = customer_bucket_re.match(bucketname)
-            if match and match.group("customer"):
-                customer = unicode(match.group('customer'))
-                if not customer in self.customer_to_buckets:
-                    self.customer_to_buckets[customer] = []
-                self.customer_to_buckets[customer].append(bucketname)
+        for bucketname in self[customer]:
+            print "\tOrphan S3 bucket: %s" % bucketname
 
 
-class Resources:
-    def __init__(self, region):
+class Vpcs(NamedListBase):
+    def __init__(self, region, pattern):
+        NamedListBase.__init__(self, self.get_vpc_list)
         self.region = region
-        self.customer_to_vpc = dict()
+        self.pattern_re = re.compile(pattern)
+
         self.unowned_vpcs = []
         self.vpc_instance_count = dict()
-        self.customer_to_buckets = dict()
         self.active_customers = set()
-        self.customer_names = []
-        self.policies = Policies()
-        self.roles = Roles()
-        self.crypto_keys = CryptoKeys(region)
 
+    def get_active_customers(self):
+        return self.active_customers
 
-    def load(self):
-        self.policies.load()
-        self.crypto_keys.load()
-        self.roles.load()
-        self.policies.load()
-        self.load_s3_buckets()
-        self.load_vpcs()
-
-        customer_found = set()
-        collections = [
-            (self.customer_to_vpc, True),
-            (self.customer_to_buckets, False),
-            (self.policies, self.roles.case_sensitive),
-            (self.roles, self.policies.case_sensitive),
-
-            (self.crypto_keys, self.crypto_keys.case_sensitive)]
-
-        for (collection, case_sensitive) in collections:
-            for customer in collection.keys():
-                lc = customer.lower()
-
-                if not customer in customer_found:
-                    customer_found.add(unicode(customer))
-                    self.customer_names.append(unicode(customer))
-                    if case_sensitive and not lc in customer_found:
-                        customer_found.add(unicode(lc))
-
-        self.customer_names.sort(key=unicode.lower)
-
-    def load_vpcs(self):
-        ec2 = boto3.client("ec2")
+    def get_vpc_list(self):
+        ec2 = boto3.session.Session(region_name=self.region).client("ec2")
         vpcs = ec2.describe_vpcs()
         vpcs = vpcs["Vpcs"]
-        for vpc in vpcs:
+        for vpc in filter(self.is_pattern_match, vpcs):
             active = False
             vpcid = vpc["VpcId"]
             self.vpc_instance_count[vpcid] = 0
@@ -243,51 +197,71 @@ class Resources:
                 self.unowned_vpcs.append(vpc)
             else:
                 customer = unicode(tags["customer"])
-                if not customer in self.customer_to_vpc:
-                    self.customer_to_vpc[customer] = []
-                self.customer_to_vpc[customer].append(vpc)
-
                 if active and customer not in self.active_customers:
                     self.active_customers.add(customer)
+                yield (customer, vpc)
 
-    def load_s3_buckets(self):
-        # customer-<customername>-f4eb065-9bf0-4ef3-a9bf-33e0c7d8da56
-        customer_bucket_re = re.compile(
-            '^customer-(?P<customer>\w+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
-        s3 = boto3.client("s3")
-        bucketlisting = s3.list_buckets()
-        buckets = bucketlisting["Buckets"]
-        for bucket in buckets:
-            bucketname = bucket["Name"]
-            match = customer_bucket_re.match(bucketname)
-            if match and match.group("customer"):
-                customer = unicode(match.group('customer'))
-                if not customer in self.customer_to_buckets:
-                    self.customer_to_buckets[customer] = []
-                self.customer_to_buckets[customer].append(bucketname)
+    def is_pattern_match(self, vpc):
+        result = False
+        tags = Resources.make_tags(vpc["Tags"])
+        if "customer" in tags:
+            match = self.pattern_re.match(tags["customer"])
+            result = match
+        return result
 
-    def print_orphan_bucket(self, customer):
-        if customer in self.customer_to_buckets:
-            for bucket in self.customer_to_buckets[customer]:
-                print "\tS3 orphan bucket: %s" % bucket
+    def print_orphans(self, customer):
+        for vpc in self[customer]:
+            print "\tOrphan VPC %s" % vpc["VpcId"]
+            tags = Resources.make_tags(vpc["Tags"])
+            for (key, value) in tags.iteritems():
+                print "\t\t%s: %s" % (key, value)
 
-    def print_orphan_vpcs(self, customer):
-        if customer in self.customer_to_vpc:
-            for vpc in self.customer_to_vpc[customer]:
-                print "\tOrphan VPC %s" % vpc["VpcId"]
-                tags = Resources.make_tags(vpc["Tags"])
-                for (key, value) in tags.iteritems():
-                    print "\t\t%s: %s" % (key, value)
+    def print_unowned(self):
+        print "Unowned VPCs:"
+        for vpc in self.unowned_vpcs:
+            print "\tUnowned VPC %s" % vpc["VpcId"]
+            tags = Resources.make_tags(vpc["Tags"])
+            for (key, value) in tags.iteritems():
+                print "\t\t%s: %s" % (key, value)
+
+
+class Resources:
+    def __init__(self, region, pattern):
+        self.region = region
+        self.pattern = pattern
+        self.customer_names = []
+        self.vpcs = Vpcs(region, self.pattern)
+        self.resources = [self.vpcs, S3Buckets(), CryptoKeys(region), Policies(), Roles()]
+
+    def load(self):
+        for resource in self.resources:
+            resource.load()
+
+        customer_found = set()
+
+        for resource in self.resources:
+            for customer in resource.keys():
+                lc = customer.lower()
+
+                if not customer in customer_found:
+                    customer_found.add(unicode(customer))
+                    self.customer_names.append(unicode(customer))
+                    if resource.is_case_sensitive() and not lc in customer_found:
+                        customer_found.add(unicode(lc))
+        self.customer_names.sort(key=unicode.lower)
 
     def print_orphans(self):
-        for customer in self.customer_names:
-            if not customer in self.active_customers:
+        pattern_re = re.compile(self.pattern)
+        for customer in filter(pattern_re.match, self.customer_names):
+            if not customer in self.vpcs.get_active_customers():
                 print customer
-                self.crypto_keys.print_orphans(customer)
-                self.print_orphan_bucket(customer)
-                self.print_orphan_vpcs(customer)
-                self.policies.print_orphans(customer)
+                for resource in self.resources:
+                    resource.print_orphans(customer)
                 print ""
+
+    def print_unowned(self):
+        self.vpcs.print_unowned()
+        print ""
 
     @staticmethod
     def make_tags(taglist):
@@ -299,14 +273,16 @@ class Resources:
 
 def main():
     parser = ArgumentParser(description='Set EC2 instance tags based on the pattern of their names.')
-    parser.add_argument("--region", default="us-east")
-    # add region option
+    parser.add_argument("--region", default="us-east-1")
+    parser.add_argument("--match", default=".*")
 
     args = parser.parse_args()
     region = args.region
+    pattern = args.match
 
-    resources = Resources(region)
+    resources = Resources(region, pattern)
     resources.load()
+    resources.print_unowned()
     resources.print_orphans()
     return 0
 
