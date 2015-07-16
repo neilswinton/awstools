@@ -42,6 +42,10 @@ class Options:
 
     @property
     def cleanup(self):
+        """
+
+        :rtype : bool
+        """
         return self._cleanup
 
 
@@ -93,7 +97,6 @@ class NamedListBase(CustomerContainer):
 
 
 class Policies(NamedListBase):
-
     def __init__(self):
         NamedListBase.__init__(self, self.get_policy_list)
         self.customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
@@ -160,7 +163,6 @@ class Roles(NamedListBase):
             for profile in role.instance_profiles.all():
                 profile.remove_role(RoleName=role.name)
 
-
     def remove_customer(self, customer):
         for role_info in self[customer]:
             print "\tRemoving IAM Role: %s" % role_info["RoleName"]
@@ -207,8 +209,6 @@ class CryptoKeys(CustomerContainer):
 
 
 class S3Buckets(NamedListBase):
-
-
     def __init__(self):
         NamedListBase.__init__(self, self.get_bucket_list)
         self.s3 = boto3.resource("s3")
@@ -233,9 +233,46 @@ class S3Buckets(NamedListBase):
         for bucketname in self[customer]:
             bucket = self.s3.Bucket(bucketname)
             print "Deleting S3 bucket %s" % bucketname
-            for object in bucket.objects.all():
-                object.delete()
-            bucket.delete()
+            for s3_object in bucket.objects.all():
+                s3_object.delete()
+
+
+class InstanceProfiles(NamedListBase):
+    def __init__(self):
+        NamedListBase.__init__(self, self.get_instance_profiles)
+        self.iam = boto3.client("iam")
+        self.customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
+
+    def instance_profile_name_to_customer_name(self, role_name):
+        match = self.customer_name_re.match(role_name)
+        return match.group("customer")
+
+    def get_instance_profiles(self):
+        is_incomplete = True
+        marker = None
+
+        while is_incomplete:
+            if marker:
+                response = self.iam.list_instance_profiles(MaxItems=100, Marker=marker)
+            else:
+                response = self.iam.list_instance_profiles(MaxItems=100)
+            is_incomplete = response["IsTruncated"]
+            if is_incomplete:
+                marker = response["Marker"]
+            for item in response["InstanceProfiles"]:
+                name = item["InstanceProfileName"]
+                if name.endswith("-s3accessor") or name.endswith("-provisioner"):
+                    yield (self.instance_profile_name_to_customer_name(name), name)
+
+    def print_orphans(self, customer):
+        for item in self[customer]:
+            print "\tOrphan Instance Profile %s" % item
+
+    def remove_customer(self, customer):
+        for instance_profile_name in self[customer]:
+            print "Deleting instance profile: %s" % instance_profile_name
+            self.iam.delete_instance_profile(InstanceProfileName=instance_profile_name)
+
 
 class Vpcs(NamedListBase):
     def __init__(self, region, pattern):
@@ -314,7 +351,8 @@ class Resources:
         self.options = options
         self.customer_names = []
         self.vpcs = Vpcs(self.options.region, self.options.pattern)
-        self.resources = [self.vpcs, S3Buckets(), CryptoKeys(self.options.region), Roles(), Policies()]
+        self.resources = [self.vpcs, InstanceProfiles(), S3Buckets(), CryptoKeys(self.options.region), Roles(),
+                          Policies()]
 
     def load(self):
         for resource in self.resources:
@@ -371,7 +409,8 @@ def main():
     resources.load()
     resources.print_unowned()
     resources.print_orphans()
-    resources.remove_orphans()
+    if options.cleanup:
+        resources.remove_orphans()
     return 0
 
 
