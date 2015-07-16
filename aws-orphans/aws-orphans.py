@@ -18,6 +18,33 @@ import re
 import boto3
 
 
+class Options:
+    def __init__(self):
+        parser = ArgumentParser(description='Find orphaned resources and optionally clean them up')
+        parser.add_argument("--region", default="us-east-1")
+        parser.add_argument("--match", default=".*")
+        parser.add_argument('--cleanup', dest='cleanup', action='store_true')
+        parser.add_argument('--no-cleanup', dest='cleanup', action='store_false')
+        parser.set_defaults(cleanup=False)
+        args = parser.parse_args()
+
+        self._region = args.region
+        self._pattern = args.match
+        self._cleanup = args.cleanup
+
+    @property
+    def region(self):
+        return self._region
+
+    @property
+    def pattern(self):
+        return self._pattern
+
+    @property
+    def cleanup(self):
+        return self._cleanup
+
+
 class CustomerContainer:
     def __init__(self, case_sensitive=True):
         self.customer_to_resource = dict()
@@ -43,8 +70,15 @@ class CustomerContainer:
         return self.customer_to_resource.keys()
 
     def print_customer_resources(self, customer, message):
+        # noinspection PyUnusedLocal
         for resource in self[customer]:
             print message % customer
+
+    def remove_customer(self, customer):
+        pass
+
+    def detach_customer(self, customer):
+        pass
 
 
 class NamedListBase(CustomerContainer):
@@ -59,69 +93,95 @@ class NamedListBase(CustomerContainer):
 
 
 class Policies(NamedListBase):
-    customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
 
     def __init__(self):
-        NamedListBase.__init__(self, Policies.get_policy_list)
+        NamedListBase.__init__(self, self.get_policy_list)
+        self.customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
+        self.iam_resource = boto3.resource("iam")
 
-    @staticmethod
-    def get_policy_list():
-        iam = boto3.client("iam")
-        policies = iam.list_policies()
+    def get_policy_list(self):
+        iam_client = boto3.client("iam")
+        policies = iam_client.list_policies()
         for policy in policies["Policies"]:
             policy_name = policy["PolicyName"]
             if policy_name.endswith("-s3accessor") or policy_name.endswith("-provisioner"):
-                yield (Policies.policy_name_to_customer_name(policy_name), policy)
+                yield (self.policy_name_to_customer_name(policy_name), policy)
 
-    @staticmethod
-    def policy_name_to_customer_name(policy_name):
-        match = Policies.customer_name_re.match(policy_name)
+    def policy_name_to_customer_name(self, policy_name):
+        match = self.customer_name_re.match(policy_name)
         return match.group("customer")
 
     def print_orphans(self, customer):
         for policy in self[customer]:
             print "\tOrphan IAM Policy: %s" % policy["PolicyName"]
 
+    def remove_customer(self, customer):
+        for policy_info in self[customer]:
+            print "\tRemoving IAM Policy: %s" % policy_info["PolicyName"]
+            policy = self.iam_resource.Policy(policy_info["Arn"])
+            policy.delete()
+
+    def detach_customer(self, customer):
+        for policy_info in self[customer]:
+            print "\tRemoving IAM Policy: %s" % policy_info["PolicyName"]
+            policy = self.iam_resource.Policy(policy_info["Arn"])
+            for role in policy.attached_roles.all():
+                policy.detach_role(RoleName=role.name)
+
 
 class Roles(NamedListBase):
     customer_name_re = re.compile('(?P<customer>\S+)-(s3accessor|provisioner)')
 
     def __init__(self):
-        NamedListBase.__init__(self, Roles.get_role_list)
+        NamedListBase.__init__(self, self.get_role_list)
+        self.iam_resource = boto3.resource("iam")
 
-    @staticmethod
-    def get_role_list():
+    def get_role_list(self):
         iam = boto3.client("iam")
         roles = iam.list_roles()
         for role in roles["Roles"]:
             role_name = role["RoleName"]
             if role_name.endswith("-s3accessor") or role_name.endswith("-provisioner"):
-                yield (Roles.role_name_to_customer_name(role_name), role)
+                yield (self.role_name_to_customer_name(role_name), role)
 
-    @staticmethod
-    def role_name_to_customer_name(role_name):
-        match = Roles.customer_name_re.match(role_name)
+    def role_name_to_customer_name(self, role_name):
+        match = self.customer_name_re.match(role_name)
         return match.group("customer")
 
     def print_orphans(self, customer):
         for policy in self[customer]:
             print "\tOrphan IAM Role: %s" % policy["RoleName"]
 
+    def detach_customer(self, customer):
+        for role_info in self[customer]:
+            role = self.iam_resource.Role(role_info["RoleName"])
+            for policy in role.attached_policies.all():
+                role.detach_policy(PolicyArn=policy.arn)
+            for profile in role.instance_profiles.all():
+                profile.remove_role(RoleName=role.name)
+
+
+    def remove_customer(self, customer):
+        for role_info in self[customer]:
+            print "\tRemoving IAM Role: %s" % role_info["RoleName"]
+            role = self.iam_resource.Role(role_info["RoleName"])
+            role.delete()
+
 
 class CryptoKeys(CustomerContainer):
     def __init__(self, region):
         CustomerContainer.__init__(self, case_sensitive=False)
         self.region = region
+        self.kms = boto3.client('kms')
 
     def load(self):
-        kms = boto3.client('kms')
-        keys = kms.list_keys()
+        keys = self.kms.list_keys()
 
         for key in keys["Keys"]:
             arn = key['KeyArn']
             arnparts = arn.split(":")
             if arnparts[3].startswith(self.region):
-                info = kms.describe_key(KeyId=arn)
+                info = self.kms.describe_key(KeyId=arn)
                 key_metadata = info['KeyMetadata']
                 description = None
 
@@ -140,22 +200,28 @@ class CryptoKeys(CustomerContainer):
     def print_orphans(self, customer):
         self.print_customer_resources(customer, "\tOrphan crypto key: %s")
 
+    def remove_customer(self, customer):
+        for key in self[customer]:
+            print "Deleting Key %s: %s" % (key["KeyId"], key["KeyArn"])
+            self.kms.update_key_description(KeyId=key["KeyId"], Description='{"v":1,"t":"cz-key","s":"free","c":""}')
+
 
 class S3Buckets(NamedListBase):
-    customer_bucket_re = re.compile(
-        '^customer-(?P<customer>\S+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+
 
     def __init__(self):
-        NamedListBase.__init__(self, S3Buckets.get_bucket_list)
+        NamedListBase.__init__(self, self.get_bucket_list)
+        self.s3 = boto3.resource("s3")
+        self.customer_bucket_re = re.compile(
+            '^customer-(?P<customer>\S+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 
-    @staticmethod
-    def get_bucket_list():
+    def get_bucket_list(self):
         s3 = boto3.client("s3")
         bucketlisting = s3.list_buckets()
         buckets = bucketlisting["Buckets"]
         for bucket in buckets:
             bucketname = bucket["Name"]
-            match = S3Buckets.customer_bucket_re.match(bucketname)
+            match = self.customer_bucket_re.match(bucketname)
             if match and match.group("customer"):
                 yield (match.group("customer"), bucketname)
 
@@ -163,6 +229,13 @@ class S3Buckets(NamedListBase):
         for bucketname in self[customer]:
             print "\tOrphan S3 bucket: %s" % bucketname
 
+    def remove_customer(self, customer):
+        for bucketname in self[customer]:
+            bucket = self.s3.Bucket(bucketname)
+            print "Deleting S3 bucket %s" % bucketname
+            for object in bucket.objects.all():
+                object.delete()
+            bucket.delete()
 
 class Vpcs(NamedListBase):
     def __init__(self, region, pattern):
@@ -178,20 +251,24 @@ class Vpcs(NamedListBase):
         return self.active_customers
 
     def get_vpc_list(self):
+        # noinspection PyUnresolvedReferences
         ec2 = boto3.session.Session(region_name=self.region).client("ec2")
         vpcs = ec2.describe_vpcs()
         vpcs = vpcs["Vpcs"]
         for vpc in filter(self.is_pattern_match, vpcs):
             active = False
+            # noinspection PyTypeChecker
             vpcid = vpc["VpcId"]
             self.vpc_instance_count[vpcid] = 0
             instances = ec2.describe_instances(
                 Filters=[{'Name': 'vpc-id', 'Values': [vpcid]}])
             reservations = instances["Reservations"]
             for reservation in reservations:
+                # noinspection PyUnusedLocal
                 for instance in reservation["Instances"]:
                     active = True
                     self.vpc_instance_count[vpcid] += 1
+            # noinspection PyTypeChecker
             tags = Resources.make_tags(vpc["Tags"])
             if not "customer" in tags:
                 self.unowned_vpcs.append(vpc)
@@ -217,21 +294,27 @@ class Vpcs(NamedListBase):
                 print "\t\t%s: %s" % (key, value)
 
     def print_unowned(self):
-        print "Unowned VPCs:"
-        for vpc in self.unowned_vpcs:
-            print "\tUnowned VPC %s" % vpc["VpcId"]
-            tags = Resources.make_tags(vpc["Tags"])
-            for (key, value) in tags.iteritems():
-                print "\t\t%s: %s" % (key, value)
+        if len(self.unowned_vpcs) > 0:
+            print "Unowned VPCs:"
+            for vpc in self.unowned_vpcs:
+                print "\tUnowned VPC %s" % vpc["VpcId"]
+                tags = Resources.make_tags(vpc["Tags"])
+                for (key, value) in tags.iteritems():
+                    print "\t\t%s: %s" % (key, value)
+
+    def remove_customer(self, customer):
+        for vpc in self[customer]:
+            pass
+
+            #
 
 
 class Resources:
-    def __init__(self, region, pattern):
-        self.region = region
-        self.pattern = pattern
+    def __init__(self, options):
+        self.options = options
         self.customer_names = []
-        self.vpcs = Vpcs(region, self.pattern)
-        self.resources = [self.vpcs, S3Buckets(), CryptoKeys(region), Policies(), Roles()]
+        self.vpcs = Vpcs(self.options.region, self.options.pattern)
+        self.resources = [self.vpcs, S3Buckets(), CryptoKeys(self.options.region), Roles(), Policies()]
 
     def load(self):
         for resource in self.resources:
@@ -251,7 +334,7 @@ class Resources:
         self.customer_names.sort(key=unicode.lower)
 
     def print_orphans(self):
-        pattern_re = re.compile(self.pattern)
+        pattern_re = re.compile(self.options.pattern)
         for customer in filter(pattern_re.match, self.customer_names):
             if not customer in self.vpcs.get_active_customers():
                 print customer
@@ -263,6 +346,17 @@ class Resources:
         self.vpcs.print_unowned()
         print ""
 
+    def remove_orphans(self):
+        pattern_re = re.compile(self.options.pattern)
+        for customer in filter(pattern_re.match, self.customer_names):
+            if not customer in self.vpcs.get_active_customers():
+                print customer
+                for resource in self.resources:
+                    resource.detach_customer(customer)
+                for resource in self.resources:
+                    resource.remove_customer(customer)
+                print ""
+
     @staticmethod
     def make_tags(taglist):
         result = dict()
@@ -272,18 +366,12 @@ class Resources:
 
 
 def main():
-    parser = ArgumentParser(description='Set EC2 instance tags based on the pattern of their names.')
-    parser.add_argument("--region", default="us-east-1")
-    parser.add_argument("--match", default=".*")
-
-    args = parser.parse_args()
-    region = args.region
-    pattern = args.match
-
-    resources = Resources(region, pattern)
+    options = Options()
+    resources = Resources(options)
     resources.load()
     resources.print_unowned()
     resources.print_orphans()
+    resources.remove_orphans()
     return 0
 
 
