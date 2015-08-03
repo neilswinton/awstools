@@ -23,7 +23,6 @@ class Options:
         parser = ArgumentParser(description='Find orphaned resources and optionally clean them up')
         parser.add_argument("--region", default="us-east-1")
         parser.add_argument("--match", default=".*")
-        parser.add_argument('--cleanup', dest='cleanup', action='store_true')
         parser.add_argument('--no-cleanup', dest='cleanup', action='store_false')
         parser.set_defaults(cleanup=False)
         args = parser.parse_args()
@@ -95,6 +94,8 @@ class NamedListBase(CustomerContainer):
             item_list = self.customer_find_or_create(customer)
             item_list.append(item)
 
+# TODO: Add ENI resource
+# TODO: Track Redshift
 
 class Policies(NamedListBase):
     def __init__(self):
@@ -277,6 +278,48 @@ class InstanceProfiles(NamedListBase):
             self.iam.delete_instance_profile(InstanceProfileName=instance_profile_name)
 
 
+class RedshiftClusters(NamedListBase):
+    def __init__(self, session):
+        NamedListBase.__init__(self, self.get_instances)
+        self.redshift = session.client("redshift")
+        self.active_customers = set()
+
+    @staticmethod
+    def redshift_cluster_to_customer_name(cluster):
+        if "Tags" in cluster:
+            for tag in cluster["Tags"]:
+                if "Key" in tag and "Value" in tag and tag["Key"] == "Customer":
+                    return tag["Value"]
+        return None
+
+    def get_active_customers(self):
+        return self.active_customers
+
+    def get_instances(self):
+        is_incomplete = True
+        marker = None
+        tag_keys = [ "Customer" ]
+
+        while is_incomplete:
+            if marker:
+                response = self.redshift.describe_clusters(MaxRecords=100, Marker=marker, TagKeys=tag_keys)
+            else:
+                response = self.redshift.describe_clusters(MaxRecords=100, TagKeys=tag_keys)
+            is_incomplete = "Marker" in response
+            if is_incomplete:
+                marker = response["Marker"]
+            for cluster in response["Clusters"]:
+                name = cluster["ClusterIdentifier"]
+                customer = self.redshift_cluster_to_customer_name(cluster)
+                if customer:
+                    self.active_customers.add(customer)
+                    yield(customer, cluster)
+
+    def print_orphans(self, customer):
+        for item in self[customer]:
+            print "\tOrphan Redshift Cluster %s" % item
+
+
 class Vpcs(NamedListBase):
     def __init__(self, region, pattern):
         NamedListBase.__init__(self, self.get_vpc_list)
@@ -353,9 +396,11 @@ class Vpcs(NamedListBase):
 class Resources:
     def __init__(self, options):
         self.options = options
+        self.session = boto3.session.Session(region_name=options.region)
         self.customer_names = []
         self.vpcs = Vpcs(self.options.region, self.options.pattern)
-        self.resources = [self.vpcs, InstanceProfiles(), S3Buckets(), CryptoKeys(self.options.region), Roles(),
+        self.redshift_clusters = RedshiftClusters(session=self.session)
+        self.resources = [self.vpcs, self.redshift_clusters, S3Buckets(), CryptoKeys(self.options.region), Roles(),
                           Policies()]
 
     def load(self):
@@ -375,10 +420,14 @@ class Resources:
                         customer_found.add(unicode(lc))
         self.customer_names.sort(key=unicode.lower)
 
+    def get_active_customers(self):
+        return self.vpcs.get_active_customers() | self.redshift_clusters.get_active_customers()
+
     def print_orphans(self):
         pattern_re = re.compile(self.options.pattern)
+        active = self.get_active_customers()
         for customer in filter(pattern_re.match, self.customer_names):
-            if not customer in self.vpcs.get_active_customers():
+            if not customer in active:
                 print customer
                 for resource in self.resources:
                     resource.print_orphans(customer)
