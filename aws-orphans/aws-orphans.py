@@ -174,7 +174,7 @@ class CryptoKeys(CustomerContainer):
     def __init__(self, region):
         CustomerContainer.__init__(self, case_sensitive=False)
         self.region = region
-        self.kms = boto3.client('kms')
+        self.kms = boto3.client('kms', region_name=region)
 
     def load(self):
         keys = self.kms.list_keys()
