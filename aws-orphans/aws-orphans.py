@@ -126,7 +126,7 @@ class Policies(NamedListBase):
 
     def detach_customer(self, customer):
         for policy_info in self[customer]:
-            print "\tRemoving IAM Policy: %s" % policy_info["PolicyName"]
+            print "\tDetaching IAM Policy: %s" % policy_info["PolicyName"]
             policy = self.iam_resource.Policy(policy_info["Arn"])
             for role in policy.attached_roles.all():
                 policy.detach_role(RoleName=role.name)
@@ -204,14 +204,15 @@ class CryptoKeys(CustomerContainer):
 
     def remove_customer(self, customer):
         for key in self[customer]:
-            print "Deleting Key %s: %s" % (key["KeyId"], key["KeyArn"])
+            print "\tDeleting Key %s: %s" % (key["KeyId"], key["KeyArn"])
             self.kms.update_key_description(KeyId=key["KeyId"], Description='{"v":1,"t":"cz-key","s":"free","c":""}')
 
 
 class S3Buckets(NamedListBase):
     def __init__(self):
         NamedListBase.__init__(self, self.get_bucket_list)
-        self.s3 = boto3.resource("s3")
+        self.s3_resource = boto3.resource("s3")
+        self.s3_client  = boto3.client("s3")
         self.customer_bucket_re = re.compile(
             '^customer-(?P<customer>\S+)-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
 
@@ -231,10 +232,12 @@ class S3Buckets(NamedListBase):
 
     def remove_customer(self, customer):
         for bucketname in self[customer]:
-            bucket = self.s3.Bucket(bucketname)
-            print "Deleting S3 bucket %s" % bucketname
+            bucket = self.s3_resource.Bucket(bucketname)
+            print "\tDeleting S3 bucket %s" % bucketname
             for s3_object in bucket.objects.all():
+                print "\t\tDeleting S3 object %s" % s3_object.key
                 s3_object.delete()
+            self.s3_client.delete_bucket(Bucket=bucketname)
 
 
 class InstanceProfiles(NamedListBase):
@@ -270,7 +273,7 @@ class InstanceProfiles(NamedListBase):
 
     def remove_customer(self, customer):
         for instance_profile_name in self[customer]:
-            print "Deleting instance profile: %s" % instance_profile_name
+            print "\tDeleting instance profile: %s" % instance_profile_name
             self.iam.delete_instance_profile(InstanceProfileName=instance_profile_name)
 
 
@@ -317,10 +320,11 @@ class Vpcs(NamedListBase):
 
     def is_pattern_match(self, vpc):
         result = False
-        tags = Resources.make_tags(vpc["Tags"])
-        if "customer" in tags:
-            match = self.pattern_re.match(tags["customer"])
-            result = match
+        if "Tags" in vpc:
+            tags = Resources.make_tags(vpc["Tags"])
+            if "customer" in tags:
+                match = self.pattern_re.match(tags["customer"])
+                result = match
         return result
 
     def print_orphans(self, customer):
