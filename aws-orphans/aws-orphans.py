@@ -23,6 +23,7 @@ class Options:
         parser = ArgumentParser(description='Find orphaned resources and optionally clean them up')
         parser.add_argument("--region", default="us-east-1")
         parser.add_argument("--match", default=".*")
+        parser.add_argument('--cleanup', dest='cleanup', action='store_true')
         parser.add_argument('--no-cleanup', dest='cleanup', action='store_false')
         parser.set_defaults(cleanup=False)
         args = parser.parse_args()
@@ -359,6 +360,9 @@ class Vpcs(NamedListBase):
                 customer = unicode(tags["customer"])
                 if active and customer not in self.active_customers:
                     self.active_customers.add(customer)
+                lc = customer.lower()
+                if active and lc not in self.active_customers:
+                    self.active_customers.add(lc)
                 yield (customer, vpc)
 
     def is_pattern_match(self, vpc):
@@ -416,12 +420,12 @@ class Resources:
                 if not customer in customer_found:
                     customer_found.add(unicode(customer))
                     self.customer_names.append(unicode(customer))
-                    if resource.is_case_sensitive() and not lc in customer_found:
-                        customer_found.add(unicode(lc))
+                if resource.is_case_sensitive() and not lc in customer_found:
+                    customer_found.add(unicode(lc))
         self.customer_names.sort(key=unicode.lower)
 
     def get_active_customers(self):
-        return self.vpcs.get_active_customers() | self.redshift_clusters.get_active_customers()
+        return self.vpcs.get_active_customers() # | self.redshift_clusters.get_active_customers()
 
     def print_orphans(self):
         pattern_re = re.compile(self.options.pattern)
@@ -457,13 +461,17 @@ class Resources:
 
 
 def main():
-    options = Options()
-    resources = Resources(options)
-    resources.load()
-    resources.print_unowned()
-    resources.print_orphans()
-    if options.cleanup:
-        resources.remove_orphans()
+
+    try:
+        options = Options()
+        resources = Resources(options)
+        resources.load()
+        resources.print_unowned()
+        resources.print_orphans()
+        if options.cleanup:
+            resources.remove_orphans()
+    except KeyboardInterrupt:
+        sys.exit()            
     return 0
 
 
