@@ -124,6 +124,9 @@ class Policies(NamedListBase):
         for policy_info in self[customer]:
             print "\tRemoving IAM Policy: %s" % policy_info["PolicyName"]
             policy = self.iam_resource.Policy(policy_info["Arn"])
+            for version in policy.versions.all():
+                if not version.is_default_version:
+                    version.delete()
             policy.delete()
 
     def detach_customer(self, customer):
